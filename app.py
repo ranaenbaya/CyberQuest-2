@@ -1,47 +1,60 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
-import sqlite3
 import bcrypt
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = Flask(__name__)
-app.secret_key = 'cyberquest-local-secret-key-2024'
+app.config.update(
+    SECRET_KEY=os.environ.get('SECRET_KEY'),
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+)
+
+if not app.config['SECRET_KEY']:
+    raise RuntimeError('Set the SECRET_KEY environment variable before starting CyberQuest.')
 
 # ─── Database ────────────────────────────────────────────────────────────────
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'cyberquest.db')
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise RuntimeError('Set the DATABASE_URL environment variable before starting CyberQuest.')
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # allows dict-style access like row['column']
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
     """Create tables if they don't exist — runs automatically on startup."""
     db = get_db()
-    db.executescript("""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS user_progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
             stage_id TEXT NOT NULL,
-            completed INTEGER DEFAULT 0,
+            completed BOOLEAN DEFAULT FALSE,
             score INTEGER DEFAULT 0,
-            completed_at TEXT,
+            completed_at TIMESTAMPTZ,
             UNIQUE(user_id, stage_id)
         );
-    """)
-    db.commit()
-    db.close()
+            """)
+        db.commit()
+    finally:
+        db.close()
+
+init_db()
 
 def login_required(f):
     @wraps(f)
@@ -640,10 +653,15 @@ STAGES_BY_ID = {s["id"]: s for s in STAGES}
 
 def get_completed_stages(user_id):
     db = get_db()
-    cur = db.cursor()
-    cur.execute("SELECT stage_id FROM user_progress WHERE user_id = ? AND completed = 1", (user_id,))
-    rows = cur.fetchall()
-    db.close()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT stage_id FROM user_progress WHERE user_id = %s AND completed = TRUE",
+                (user_id,)
+            )
+            rows = cur.fetchall()
+    finally:
+        db.close()
     return {row['stage_id'] for row in rows}
 
 def is_stage_unlocked(stage_id, completed_stages):
@@ -660,6 +678,22 @@ def is_stage_unlocked(stage_id, completed_stages):
     return False
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
+
+@app.route('/health')
+def health():
+    db = None
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute('SELECT 1')
+            cur.fetchone()
+        return jsonify({'status': 'ok'}), 200
+    except psycopg2.Error:
+        app.logger.exception('Health check failed while querying the database')
+        return jsonify({'status': 'unhealthy'}), 503
+    finally:
+        if db is not None:
+            db.close()
 
 @app.route('/')
 def index():
@@ -712,23 +746,27 @@ def register():
 
     password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
+    db = None
     try:
         db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-            (username, email, password_hash)
-        )
-        user_id = cur.lastrowid
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s) RETURNING id",
+                (username, email, password_hash)
+            )
+            user_id = cur.fetchone()['id']
         db.commit()
-        db.close()
         session['user_id'] = user_id
         session['username'] = username
         return jsonify({'success': True, 'redirect': '/stages'})
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return jsonify({'error': 'Username or email already exists'}), 409
-    except Exception as e:
+    except psycopg2.Error:
+        app.logger.exception('Registration failed while querying the database')
         return jsonify({'error': 'Registration failed'}), 500
+    finally:
+        if db is not None:
+            db.close()
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -739,15 +777,15 @@ def login():
     if not username or not password:
         return jsonify({'error': 'All fields are required'}), 400
 
+    db = None
     try:
         db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ? OR email = ?",
-            (username, username.lower())
-        )
-        user = cur.fetchone()
-        db.close()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, password_hash FROM users WHERE username = %s OR email = %s",
+                (username, username.lower())
+            )
+            user = cur.fetchone()
 
         if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
             return jsonify({'error': 'Invalid username or password'}), 401
@@ -755,8 +793,12 @@ def login():
         session['user_id'] = user['id']
         session['username'] = user['username']
         return jsonify({'success': True, 'redirect': '/stages'})
-    except Exception as e:
+    except psycopg2.Error:
+        app.logger.exception('Login failed while querying the database')
         return jsonify({'error': 'Login failed'}), 500
+    finally:
+        if db is not None:
+            db.close()
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
@@ -813,21 +855,25 @@ def submit_quiz(stage_id):
     passed = score >= 80
 
     if passed:
+        db = None
         try:
             db = get_db()
-            cur = db.cursor()
-            cur.execute("""
+            with db.cursor() as cur:
+                cur.execute("""
                 INSERT INTO user_progress (user_id, stage_id, completed, score, completed_at)
-                VALUES (?, ?, 1, ?, ?)
+                VALUES (%s, %s, TRUE, %s, %s)
                 ON CONFLICT (user_id, stage_id)
-                DO UPDATE SET completed = 1,
-                              score = MAX(user_progress.score, excluded.score),
-                              completed_at = excluded.completed_at
-            """, (session['user_id'], stage_id, score, datetime.utcnow().isoformat()))
+                DO UPDATE SET completed = TRUE,
+                              score = GREATEST(user_progress.score, EXCLUDED.score),
+                              completed_at = EXCLUDED.completed_at
+                """, (session['user_id'], stage_id, score, datetime.now(timezone.utc)))
             db.commit()
-            db.close()
-        except Exception:
-            pass
+        except psycopg2.Error:
+            app.logger.exception('Failed to save quiz progress')
+            return jsonify({'error': 'Could not save quiz progress'}), 503
+        finally:
+            if db is not None:
+                db.close()
 
     return jsonify({
         'score': score,
@@ -838,5 +884,4 @@ def submit_quiz(stage_id):
     })
 
 if __name__ == '__main__':
-    init_db()  # Creates cyberquest.db and tables automatically on first run
-    app.run(debug=True)
+    app.run()
